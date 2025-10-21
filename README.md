@@ -1,5 +1,10 @@
 # Reproducing LoRA without Regret
 
+## tl;dr
+This repository contains the code and results for reproducing the SFT and RL experiments in the [LoRA without Regret blog post](https://thinkingmachines.ai/blog/lora/) by John Schulman and Thinking Machines.
+
+We reproduce the same finding that **LoRAs can match full fine tuning performance in low data regimes**, and observe similar patterns in optimal learning rates for various LoRA configurations.
+
 Key results:
 1. In a low data regime, LoRA SFT and RL can match performance of full fine-tuning.
 2. Optimal learning rate of LoRA is around 10x higher than full fine tuning.
@@ -76,12 +81,7 @@ We hold the following hyperparameters constant for every run:
 
 We observe that LoRA fine tuning can match the performance of full fine tuning, even with **only rank 1**!
 
-## Conclusions
-This repository contains the code and results for reproducing the SFT and RL experiments in the [LoRA without Regret blog post](https://thinkingmachines.ai/blog/lora/) by John Schulman and Thinking Machines.
-
-We reproduce the same finding that **LoRAs can match full fine tuning performance in low data regimes**, and observe similar patterns in optimal learning rates for various LoRA configurations.
-
-## Navigation
+## Code Navigation
 
 - `sft_full.py`: SFT training script for full fine tuning
 - `sft_lora.py`: SFT training script for LoRA fine tuning
