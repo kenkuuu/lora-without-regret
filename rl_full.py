@@ -2,7 +2,7 @@
 this script requires vllm's v0 engine which has a hacky way to reload model weights
 so we have pinned to v0.10.2 release of vllm
 
-uv run rl_full.py --lr 1e-4 --disable_wandb
+uv run rl_full.py --lr 1e-5 --disable_wandb
 """
 
 from vllm import LLM, SamplingParams
@@ -33,7 +33,7 @@ def parse_args():
         help="HuggingFace model ID to use",
     )
 
-    parser.add_argument("--lr", type=float, default=9e-5, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument(
         "--n_grpo_steps",
         type=int,

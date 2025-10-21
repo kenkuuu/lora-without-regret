@@ -70,6 +70,7 @@ We hold the following hyperparameters constant for every run:
 - We perform 50 GRPO steps
 - We randomly sample 32 prompts at each training step
 - For each prompt we generate 8 rollouts using [vllm](https://github.com/vllm-project/vllm)
+  - Each rollout is sampled with max_new_tokens=1024 to save time (99% of the ground truth solutions traces in the dataset are less than 1024 tokens)
 - Use GRPO to compute the advantage of each rollout
 - On-policy: we only perform a single optimizer update per GRPO step
 - Adam optimizer
