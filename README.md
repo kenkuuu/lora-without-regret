@@ -100,7 +100,7 @@ training scripts:
 misc:
 - `math_utils.py`: utilities for extracting boxed math answers and comparing equivalence of two math expression strings
 
-run data for my experiments (stored in sqlite files):
+run data for my experiments:
 - `results/wandb_sft_export.db`
 - `results/wandb_rl_export.db`
-- `dataschema.md`: describes the data schema of the sqlite dbs
+- `results/dataschema.md`: describes the data schema of the sqlite dbs
