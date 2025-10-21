@@ -79,7 +79,7 @@ We observe that LoRA fine tuning can match the performance of full fine tuning, 
 ## Conclusions
 This repository contains the code and results for reproducing the SFT and RL experiments in the [LoRA without Regret blog post](https://thinkingmachines.ai/blog/lora/) by John Schulman and Thinking Machines.
 
-We reproduce the same finding that LoRAs can match full fine tuning performance in low data regimes, and observe similar patterns in optimal learning rates for various LoRA configurations.
+We reproduce the same finding that **LoRAs can match full fine tuning performance in low data regimes**, and observe similar patterns in optimal learning rates for various LoRA configurations.
 
 ## Navigation
 
