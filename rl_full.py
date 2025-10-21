@@ -2,7 +2,7 @@
 this script requires vllm's v0 engine which has a hacky way to reload model weights
 so we have pinned to v0.10.2 release of vllm
 
-uv run rl_full.py --lr 1e-4
+uv run rl_full.py --lr 1e-4 --disable_wandb
 """
 
 from vllm import LLM, SamplingParams
@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument(
         "--model_id",
         type=str,
-        default="Qwen/Qwen3-1.7",
+        default="Qwen/Qwen3-1.7B",
         help="HuggingFace model ID to use",
     )
 

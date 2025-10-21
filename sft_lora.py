@@ -4,9 +4,9 @@ CUDA_VISIBLE_DEVICES=0 uv run sft_lora.py \
   --lr 2e-4 \
   --lora-rank 64 \
   --lora-type all \
-  --output-dir ./my_lora_model \
+  --output-dir ./lora_model \
   --wandb-project qwen-lora-test \
-  --wandb-run-name experiment-01
+  --wandb-run-name lr_2e-4
 """
 
 import argparse
@@ -28,7 +28,7 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     # Make deterministic (may impact performance)
-    # but doesn't seem to have any perf impact on this script
+    # but doesn't seem to have any perf impact on my setup
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 

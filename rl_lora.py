@@ -3,11 +3,12 @@ this script requires a vllm instance to be run on the same node with --enable-lo
 in another terminal, install vllm and then run the following commands
 ```
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
+source .venv/bin/activate
 CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-1.7B --enable-lora
 ```
 
 then run this training script after the vllm instance is set up
-uv run math_grpo_lora.py --lr 1e-4 --lora_r 1 --model_id Qwen/Qwen3-1.7B
+uv run rl_lora.py --lr 1e-4 --lora_r 1 --model_id Qwen/Qwen3-1.7B --disable_wandb
 
 this script save the LoRA weights to filesystem on each iteration
 and then send requests to the vllm instance to load the lora weights and use them during inference

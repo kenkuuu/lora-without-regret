@@ -1,10 +1,9 @@
 """
-CUDA_VISIBLE_DEVICES=0 uv run train_full.py \
+CUDA_VISIBLE_DEVICES=0 uv run sft_full.py \
   --model-id Qwen/Qwen3-4B \
   --lr 5e-6 \
-  --output-dir ./my_finetuned_model \
-  --wandb-project qwen-finetune-test \
-  --wandb-run-name experiment-01
+  --output-dir ./full_ft_model \
+  --no-wandb
 """
 
 import argparse
@@ -25,7 +24,7 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     # Make deterministic (may impact performance)
-    # but doesn't seem to have any perf impact on this script
+    # but doesn't seem to have any perf impact on my setup
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
