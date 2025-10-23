@@ -1,33 +1,8 @@
 # Reproducing LoRA without Regret
 
-## tl;dr
-This repository contains the code and results for reproducing the SFT and RL experiments in the [LoRA without Regret blog post](https://thinkingmachines.ai/blog/lora/) by John Schulman and Thinking Machines.
-
-We reproduce the same finding that **LoRAs can match full fine tuning performance in low data regimes**, and observe similar patterns in optimal learning rates for various LoRA configurations.
-
-Key results:
-1. In a low data regime, LoRA SFT and RL can match performance of full fine-tuning.
-2. Optimal learning rate of LoRA is around 10x higher than full fine tuning.
-3. For SFT, lower rank LoRAs have lower optimal learning rates
-
-## SFT Experiments
 Model: [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B)
 
 Dataset: We use the first 6400 examples in the train split of the [No Robots dataset](https://huggingface.co/datasets/HuggingFaceH4/no_robots) and the first 100 examples in test split for validation. No Robots is an instruction following dataset collected by human annotators.
-
-We do learning rate sweeps for the following configurations:
-- Full fine tune
-- Rank 256 LoRA applied to attn-only
-- Rank 256 LoRA applied to mlp-only
-- Rank 256 LoRA applied to mlp and attn
-- Rank 16 LoRA applied to mlp and attn
-- Rank 1 LoRA applied to mlp and attn
-
-We hold the following hyperparameters constant for every run:
-- Train for one epoch with effective batch size of 32, so we train for a total of 200 steps.
-- AdamW optimizer
-- LoRA alpha = 32
-- Constant learning rate scheduler
 
 ### Results
 | Rank | Type | Optimal LR  | Test NLL |
