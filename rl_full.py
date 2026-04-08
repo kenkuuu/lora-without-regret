@@ -117,6 +117,11 @@ def parse_args():
         default=0.3,
         help="vLLM GPU memory utilization",
     )
+    parser.add_argument(
+        "--num_train_gpus",
+        type=int,
+        default=3,
+    )
 
     return parser.parse_args()
 
@@ -182,6 +187,7 @@ def main():
     train_dataset = train_dataset.map(process_data)
     val_dataset = val_dataset.map(process_data)
     if accelerator.is_main_process:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.num_train_gpus)
         vllm_model = LLM(
             model=args.model_id,
             tensor_parallel_size=1,
@@ -199,6 +205,10 @@ def main():
             # enable_sleep_mode=self.args.vllm_enable_sleep_mode,
             # Important so temperature scaling/logit tweaking affects the TIS log probs
             logprobs_mode="processed_logprobs",
+            distributed_executor_backend="mp",
+        )
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(i) for i in range(args.num_train_gpus)
         )
     else:
         vllm_model = None
