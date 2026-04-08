@@ -114,13 +114,14 @@ def parse_args():
     parser.add_argument(
         "--gpu_memory_utilization",
         type=float,
-        default=0.3,
-        help="vLLM GPU memory utilization",
+        default=0.8,
+        help="vLLM GPU memory utilization (vLLM runs on a dedicated GPU)",
     )
     parser.add_argument(
         "--num_train_gpus",
         type=int,
         default=3,
+        help="Number of GPUs for training. vLLM uses GPU index num_train_gpus.",
     )
 
     return parser.parse_args()
@@ -129,19 +130,41 @@ def parse_args():
 def main():
     args = parse_args()
 
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    if local_rank == 0:
+        # vLLM専用GPU（num_train_gpus番）だけ見せて初期化
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.num_train_gpus)
+        vllm_model = LLM(
+            model=args.model_id,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=2048,
+            max_num_batched_tokens=4096,
+            logprobs_mode="processed_logprobs",
+        )
+        # vLLM初期化後は学習GPU群（0〜num_train_gpus-1）に戻す
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+            str(i) for i in range(args.num_train_gpus)
+        )
+    else:
+        vllm_model = None
+
+    # vLLM初期化後にAcceleratorを起動 → NCCLのTCPStoreと競合しない
     accelerator = Accelerator()
     device = accelerator.device
-    
+
     # Set random seed
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+
     if accelerator.is_main_process:
         print(f"Training configuration:")
         print(f"  Model ID: {args.model_id}")
         print(f"  Learning rate: {args.lr}")
         print(f"  W&B logging: {'enabled' if not args.disable_wandb else 'disabled'}")
         print()
-    
+
         # Setup run directory
         os.makedirs(args.base_dir, exist_ok=True)
         i = 1
@@ -150,7 +173,7 @@ def main():
         run_name = f"{args.base_dir}/{i}"
         os.makedirs(run_name)
         print(f"Created: {run_name}")
-    
+
         # Initialize wandb
         if not args.disable_wandb:
             wandb_run_name = args.wandb_run_name or f"{args.model_id}_{args.lr:.1e}_full"
@@ -160,7 +183,6 @@ def main():
                 config=vars(args),
                 dir=run_name,
             )
-            # Log the run directory
             wandb.config.update({"run_dir": run_name})
 
     # Load dataset and tokenizer
@@ -186,59 +208,35 @@ def main():
 
     train_dataset = train_dataset.map(process_data)
     val_dataset = val_dataset.map(process_data)
-    if accelerator.is_main_process:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.num_train_gpus)
-        vllm_model = LLM(
-            model=args.model_id,
-            tensor_parallel_size=1,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            # max_num_seqs=self.args.per_device_train_batch_size
-            # * self.vllm_tensor_parallel_size
-            # * self.args.steps_per_generation,
-            max_model_len=2048,
-            # distributed_executor_backend="mp",
-            # Feed identical seed for tp groups to ensure sampling results are the same across workers
-            # seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
-            # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
-            max_num_batched_tokens=4096,
-            # model_impl=self.args.vllm_model_impl,
-            # enable_sleep_mode=self.args.vllm_enable_sleep_mode,
-            # Important so temperature scaling/logit tweaking affects the TIS log probs
-            logprobs_mode="processed_logprobs",
-            distributed_executor_backend="mp",
-        )
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
-            str(i) for i in range(args.num_train_gpus)
-        )
-    else:
-        vllm_model = None
 
-    # generate util for calling vllm
     def generate(prompts: list[str], model, temperature=0, responses_per_prompt=1):
         """
-        takes in a list of prompts list[str]
-        and returns a list of outputs list[str]
+        Takes in a list of prompts shared across all processes,
+        runs generation on rank0 only, and broadcasts results to all.
+        Returns a list of outputs of length len(prompts) * responses_per_prompt.
         """
-        # move weights from model to vllm
         if accelerator.is_main_process:
+            # HFモデルの最新重みをCPU経由でvLLM専用GPUに転送
             unwrapped_model = accelerator.unwrap_model(model)
-            weight_tuples = [(n, p.cpu()) for n, p in unwrapped_model.named_parameters()]
+            weight_tuples = [(n, p.detach().cpu()) for n, p in unwrapped_model.named_parameters()]
             vllm_internal_model = (
                 vllm_model.llm_engine.model_executor.driver_worker.model_runner.model
             )
             vllm_internal_model.load_weights(weight_tuples)
-    
+
             sampling_params = SamplingParams(
                 max_tokens=1024,
                 temperature=temperature,
                 n=responses_per_prompt,
             )
-    
-            outputs = vllm_model.generate(prompts, sampling_params)
-            outputs = [o.text for output in outputs for o in output.outputs]
+            raw_outputs = vllm_model.generate(prompts, sampling_params)
+            outputs = [o.text for output in raw_outputs for o in output.outputs]
         else:
+            # Placeholder; overwritten by broadcast below
             outputs = [None] * (len(prompts) * responses_per_prompt)
 
+        # rank0の推論完了を全プロセスで同期してからbroadcast
+        accelerator.wait_for_everyone()
         if accelerator.num_processes > 1:
             outputs = broadcast_object_list(outputs, from_process=0)
         return outputs
@@ -253,17 +251,17 @@ def main():
         OUTPUT: all of shape (len(prompt_strs), max_len - 1)
             - input_ids: input tokens
             - labels: output tokens (basically the inputs shifted 1 to the left)
-            - response_mask: 1 indicates token that the model generate, 0 means prompt or padding
+            - response_mask: 1 indicates token that the model generated, 0 means prompt or padding
         """
         prompt_t = [tokenizer.encode(p) for p in prompt_strs]
         output_t = [tokenizer.encode(o) for o in output_strs]
-        full = []
         max_len = 0
 
         for i in range(len(prompt_t)):
             row_len = len(prompt_t[i]) + len(output_t[i])
             max_len = max(max_len, row_len)
 
+        full = []
         for i in range(len(prompt_t)):
             padding_size = max_len - len(prompt_t[i]) - len(output_t[i])
             padding = [tokenizer.pad_token_id] * padding_size
@@ -291,14 +289,7 @@ def main():
         labels: torch.Tensor,
     ) -> torch.Tensor:
         logits = model(input_ids).logits
-        # z = logits - logits.max(dim=-1, keepdim=True).values
-        # exp_z = torch.exp(z)
-        # denom = exp_z.sum(dim=-1, keepdim=True)
-        # # p = exp_z / denom
-        # logprobs = z - torch.log(denom)
-        # logprobs_for_label = torch.gather(
-        #     logprobs, dim=-1, index=labels.unsqueeze(-1)
-        # ).squeeze(-1)
+        # F.log_softmaxのfused kernelで計算することでメモリ使用量を削減
         logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         logprobs_for_label = torch.gather(
             logprobs, dim=-1, index=labels.unsqueeze(-1)
@@ -306,6 +297,7 @@ def main():
         return logprobs_for_label
 
     def eval_model(model, step):
+        """Must be called only on the main process."""
         val_prompts = val_dataset[:1000]["prompt"]
 
         eval_start = time.time()
@@ -329,7 +321,6 @@ def main():
         accuracy = correct / len(outputs)
         print(f"step={step}, correct: {correct} / {len(outputs)} ({accuracy:.2%})")
 
-        # Log to wandb
         if not args.disable_wandb:
             wandb.log(
                 {
@@ -343,51 +334,45 @@ def main():
 
         return correct, idx_correct, idx_wrong
 
-    # device = "cuda:0"
-
     # Load model
     model_kwargs = dict(
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         use_cache=False,
-        # device_map=device,
     )
     model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
     model, optimizer = accelerator.prepare(model, optimizer)
-    # Training loop
+
+    # Initial evaluation
     if accelerator.is_main_process:
         print("Starting initial evaluation...")
-    # model = model.to(device)
-    # c, ic, iw = eval_model(model, 0)
-    if accelerator.is_main_process:
         eval_model(model, 0)
+    accelerator.wait_for_everyone()
     model.train()
 
-    local_prompts_per_step = args.n_prompts_per_step // accelerator.num_processes
+    num_processes = accelerator.num_processes
+    proc_idx = accelerator.process_index
 
     for i in range(args.n_grpo_steps):
         step_start_time = time.time()
 
-        # sample_indices = random.sample(
-        #     range(0, len(train_dataset)), local_prompts_per_step
-        # )
-        # batch = train_dataset[sample_indices]
+        # sample_indicesをrank0で生成してbroadcast
+        # → 全プロセスが同じbatchを参照することでgenerate出力とanswerが一致する
         if accelerator.is_main_process:
             sample_indices = random.sample(
                 range(len(train_dataset)), args.n_prompts_per_step
             )
         else:
             sample_indices = [None] * args.n_prompts_per_step
-        
+
         if accelerator.num_processes > 1:
             sample_indices = broadcast_object_list(sample_indices, from_process=0)
-        
+
         batch = train_dataset[sample_indices]
 
-        # Generate rollouts
+        # Generate rollouts (rank0のみ推論、結果をbroadcast)
         generation_start = time.time()
         outputs = generate(
             batch["prompt"],
@@ -397,10 +382,9 @@ def main():
         )
         generation_time = time.time() - generation_start
 
-        # Extract answers
+        # Compute rewards and advantages over the full batch
         generated_answers = [remove_boxed(last_boxed_only_string(o)) for o in outputs]
 
-        # Compute advantages
         raw_reward = [
             a is not None and is_equiv(a, batch["answer"][j // args.group_size])
             for j, a in enumerate(generated_answers)
@@ -413,7 +397,7 @@ def main():
             (args.n_prompts_per_step * args.group_size,)
         )
 
-        # Reward statistics
+        # Reward / advantage statistics (logged from main process)
         train_accuracy = raw_reward_tensor.mean().item()
         reward_std = raw_reward_tensor.std().item()
         reward_max = raw_reward_tensor.max().item()
@@ -423,31 +407,25 @@ def main():
         advantage_max = advantages.max().item()
         advantage_min = advantages.min().item()
 
-        # Tokenize
+        # Tokenize full batch
         prompts_expanded = [x for x in batch["prompt"] for _ in range(args.group_size)]
-        # data = tokenize_prompt_and_output(prompts_expanded, outputs, tokenizer)
-        # input_ids = data["input_ids"].to(device)
-        # labels = data["labels"].to(device)
-        # response_mask = data["response_mask"].to(device)
-        num_processes = accelerator.num_processes
-        proc_idx = accelerator.process_index
-        
         data = tokenize_prompt_and_output(prompts_expanded, outputs, tokenizer)
         input_ids = data["input_ids"].to(device)
         labels = data["labels"].to(device)
         response_mask = data["response_mask"].to(device)
 
+        # Shard across processes: each GPU trains on its own slice
         total_rollouts = len(input_ids)
         per_proc = total_rollouts // num_processes
         start = proc_idx * per_proc
         end = start + per_proc
-        
+
         input_ids     = input_ids[start:end]
         labels        = labels[start:end]
         response_mask = response_mask[start:end]
         advantages    = advantages[start:end]
 
-        # Compute old log probs
+        # Compute old log probs (on each process's local shard)
         with torch.inference_mode():
             old_logprobs_all = []
             for b in range(max(1, len(input_ids) // args.micro_batch_size)):
@@ -459,61 +437,49 @@ def main():
             old_logprobs_all = torch.cat(old_logprobs_all, dim=0)
             assert old_logprobs_all.shape == labels.shape
 
-        # Train for epochs_per_step
+        # Training epochs
         epoch_grad_norms = []
         epoch_policy_ratios = []
         epoch_kl_divs = []
 
         training_start = time.time()
         for epoch in range(args.epochs_per_step):
-            # for b in tqdm(
-            #     range(len(input_ids) // args.micro_batch_size),
-            #     desc=f"Step {i + 1}/{args.n_grpo_steps}, Epoch {epoch + 1}/{args.epochs_per_step}",
-            # ):
             batches = range(max(1, len(input_ids) // args.micro_batch_size))
             if accelerator.is_main_process:
                 batches = tqdm(batches, desc=f"Step {i + 1}/{args.n_grpo_steps}")
-            
+
             for b in batches:
                 idx = b * args.micro_batch_size
-                end = idx + args.micro_batch_size
-                x = input_ids[idx:end]
-                y = labels[idx:end]
-                mask = response_mask[idx:end]
-                micro_batch_adv = advantages[idx:end].unsqueeze(-1).to(device)
+                end_idx = idx + args.micro_batch_size
+                x = input_ids[idx:end_idx]
+                y = labels[idx:end_idx]
+                mask = response_mask[idx:end_idx]
+                micro_batch_adv = advantages[idx:end_idx].unsqueeze(-1).to(device)
 
-                # Get the per token log probs of each rollout
                 policy_logprobs = get_response_log_probs(model, x, y)
-                old_logprobs = old_logprobs_all[idx:end]
+                old_logprobs = old_logprobs_all[idx:end_idx]
 
-                # Compute per token loss
                 ratio = torch.exp(policy_logprobs - old_logprobs)
                 per_token_loss = -ratio * micro_batch_adv
 
-                # Compute KL divergence (approximate)
                 with torch.no_grad():
                     # KL(old || new) ≈ (ratio - 1) - log(ratio)
                     approx_kl = ((ratio - 1) - torch.log(ratio)) * mask
                     approx_kl_mean = approx_kl.sum() / mask.sum()
                     epoch_kl_divs.append(approx_kl_mean.item())
 
-                    # Policy ratio statistics
                     policy_ratio_mean = (ratio * mask).sum() / mask.sum()
                     epoch_policy_ratios.append(policy_ratio_mean.item())
 
-                # Apply mask so we only train on the generated tokens
                 masked_loss = per_token_loss * mask
-
-                # Compute a scalar loss and call backward()
                 denom = mask.sum(dim=-1).clamp_min(1)
                 loss_per_prompt = masked_loss.sum(dim=-1) / denom
                 loss = loss_per_prompt.mean() / args.gradient_accumulation_steps
 
-                # loss.backward()
                 accelerator.backward(loss)
 
                 if (b + 1) % args.gradient_accumulation_steps == 0:
-                    # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    # accelerator経由でDDP環境でも正しくgradをclip
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     epoch_grad_norms.append(grad_norm.item())
                     optimizer.step()
@@ -522,9 +488,8 @@ def main():
         training_time = time.time() - training_start
         step_time = time.time() - step_start_time
 
-        # Log metrics to wandb
+        # Logging (main process only)
         if accelerator.is_main_process:
-            # Compute statistics
             mean_grad_norm = (
                 sum(epoch_grad_norms) / len(epoch_grad_norms) if epoch_grad_norms else 0
             )
@@ -534,31 +499,27 @@ def main():
                 else 0
             )
             mean_kl = sum(epoch_kl_divs) / len(epoch_kl_divs) if epoch_kl_divs else 0
-    
-            # Count total tokens generated
+
             total_tokens = response_mask.sum().item()
             tokens_per_sec = total_tokens / generation_time if generation_time > 0 else 0
             avg_generation_len = int(response_mask.sum(dim=-1).float().mean().item())
+
             if not args.disable_wandb:
                 wandb.log(
                     {
-                        # Reward metrics
                         "train/accuracy": train_accuracy,
                         "train/reward_mean": train_accuracy,
                         "train/reward_std": reward_std,
                         "train/reward_max": reward_max,
                         "train/reward_min": reward_min,
-                        # Advantage metrics
                         "train/advantage_mean": advantage_mean,
                         "train/advantage_std": advantage_std,
                         "train/advantage_max": advantage_max,
                         "train/advantage_min": advantage_min,
-                        # Training dynamics
                         "train/grad_norm": mean_grad_norm,
                         "train/policy_ratio": mean_policy_ratio,
                         "train/approx_kl": mean_kl,
                         "train/avg_gen_length": avg_generation_len,
-                        # Timing metrics
                         "time/step_time": step_time,
                         "time/generation_time": generation_time,
                         "time/training_time": training_time,
@@ -566,7 +527,7 @@ def main():
                     },
                     step=i + 1,
                 )
-    
+
             print(
                 f"Step {i + 1}/{args.n_grpo_steps} | Train Acc: {train_accuracy:.2%} | KL: {mean_kl:.4f} | Time: {step_time:.1f}s"
             )
@@ -574,6 +535,7 @@ def main():
         if (i + 1) % 5 == 0:
             if accelerator.is_main_process:
                 eval_model(model, i + 1)
+            accelerator.wait_for_everyone()
 
     if accelerator.is_main_process and not args.disable_wandb:
         wandb.finish()
