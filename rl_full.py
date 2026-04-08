@@ -16,6 +16,8 @@ import argparse
 import wandb
 import time
 import os
+from accelerate import Accelerator
+from accelerate.utils import broadcast_object_list
 
 os.environ["VLLM_USE_V1"] = (
     "0"  # use v0 engine because it lets us move weights between hf_model and vllm_model
@@ -116,42 +118,45 @@ def parse_args():
 def main():
     args = parse_args()
 
+    accelerator = Accelerator()
+    device = accelerator.device
+    
     # Set random seed
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-
-    print(f"Training configuration:")
-    print(f"  Model ID: {args.model_id}")
-    print(f"  Learning rate: {args.lr}")
-    print(f"  W&B logging: {'enabled' if not args.disable_wandb else 'disabled'}")
-    print()
-
-    # Setup run directory
-    os.makedirs(args.base_dir, exist_ok=True)
-    i = 1
-    while os.path.exists(f"{args.base_dir}/{i}"):
-        i += 1
-    run_name = f"{args.base_dir}/{i}"
-    os.makedirs(run_name)
-    print(f"Created: {run_name}")
-
-    # Initialize wandb
-    if not args.disable_wandb:
-        wandb_run_name = args.wandb_run_name or f"{args.model_id}_{args.lr:.1e}_full"
-        wandb.init(
-            project=args.wandb_project,
-            name=wandb_run_name,
-            config=vars(args),
-            dir=run_name,
-        )
-        # Log the run directory
-        wandb.config.update({"run_dir": run_name})
+    if accelerator.is_main_process:
+        print(f"Training configuration:")
+        print(f"  Model ID: {args.model_id}")
+        print(f"  Learning rate: {args.lr}")
+        print(f"  W&B logging: {'enabled' if not args.disable_wandb else 'disabled'}")
+        print()
+    
+        # Setup run directory
+        os.makedirs(args.base_dir, exist_ok=True)
+        i = 1
+        while os.path.exists(f"{args.base_dir}/{i}"):
+            i += 1
+        run_name = f"{args.base_dir}/{i}"
+        os.makedirs(run_name)
+        print(f"Created: {run_name}")
+    
+        # Initialize wandb
+        if not args.disable_wandb:
+            wandb_run_name = args.wandb_run_name or f"{args.model_id}_{args.lr:.1e}_full"
+            wandb.init(
+                project=args.wandb_project,
+                name=wandb_run_name,
+                config=vars(args),
+                dir=run_name,
+            )
+            # Log the run directory
+            wandb.config.update({"run_dir": run_name})
 
     # Load dataset and tokenizer
     train_dataset = load_dataset("qwedsacf/competition_math", split=f"train[:7500]")
     val_dataset = load_dataset("qwedsacf/competition_math", split=f"train[-5000:]")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    if tokenizer.pad_token_id == None:
+    if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # Load prompt template
@@ -170,25 +175,27 @@ def main():
 
     train_dataset = train_dataset.map(process_data)
     val_dataset = val_dataset.map(process_data)
-
-    vllm_model = LLM(
-        model=args.model_id,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.4,
-        # max_num_seqs=self.args.per_device_train_batch_size
-        # * self.vllm_tensor_parallel_size
-        # * self.args.steps_per_generation,
-        max_model_len=2048,
-        # distributed_executor_backend="mp",
-        # Feed identical seed for tp groups to ensure sampling results are the same across workers
-        # seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
-        # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
-        max_num_batched_tokens=4096,
-        # model_impl=self.args.vllm_model_impl,
-        # enable_sleep_mode=self.args.vllm_enable_sleep_mode,
-        # Important so temperature scaling/logit tweaking affects the TIS log probs
-        logprobs_mode="processed_logprobs",
-    )
+    if accelerator.is_main_process:
+        vllm_model = LLM(
+            model=args.model_id,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=0.4,
+            # max_num_seqs=self.args.per_device_train_batch_size
+            # * self.vllm_tensor_parallel_size
+            # * self.args.steps_per_generation,
+            max_model_len=2048,
+            # distributed_executor_backend="mp",
+            # Feed identical seed for tp groups to ensure sampling results are the same across workers
+            # seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
+            # Latest vLLM v1 memory profiler is misled by the high default value (i.e., 32768) - thinking there's not enough memory
+            max_num_batched_tokens=4096,
+            # model_impl=self.args.vllm_model_impl,
+            # enable_sleep_mode=self.args.vllm_enable_sleep_mode,
+            # Important so temperature scaling/logit tweaking affects the TIS log probs
+            logprobs_mode="processed_logprobs",
+        )
+    else:
+        vllm_model = None
 
     # generate util for calling vllm
     def generate(prompts: list[str], model, temperature=0, responses_per_prompt=1):
@@ -197,20 +204,27 @@ def main():
         and returns a list of outputs list[str]
         """
         # move weights from model to vllm
-        weight_tuples = [(n, p) for n, p in model.named_parameters()]
-        vllm_internal_model = (
-            vllm_model.llm_engine.model_executor.driver_worker.model_runner.model
-        )
-        vllm_internal_model.load_weights(weight_tuples)
+        if accelerator.is_main_process:
+            unwrapped_model = accelerator.unwrap_model(model)
+            weight_tuples = [(n, p) for n, p in unwrapped_model.named_parameters()]
+            vllm_internal_model = (
+                vllm_model.llm_engine.model_executor.driver_worker.model_runner.model
+            )
+            vllm_internal_model.load_weights(weight_tuples)
+    
+            sampling_params = SamplingParams(
+                max_tokens=1024,
+                temperature=temperature,
+                n=responses_per_prompt,
+            )
+    
+            outputs = vllm_model.generate(prompts, sampling_params)
+            outputs = [o.text for output in outputs for o in output.outputs]
+        else:
+            outputs = [None] * (len(prompts) * responses_per_prompt)
 
-        sampling_params = SamplingParams(
-            max_tokens=1024,
-            temperature=temperature,
-            n=responses_per_prompt,
-        )
-
-        outputs = vllm_model.generate(prompts, sampling_params)
-        outputs = [o.text for output in outputs for o in output.outputs]
+        if accelerator.num_processes > 1:
+            outputs = broadcast_object_list(outputs, from_process=0)
         return outputs
 
     def tokenize_prompt_and_output(
@@ -264,7 +278,7 @@ def main():
         z = logits - logits.max(dim=-1, keepdim=True).values
         exp_z = torch.exp(z)
         denom = exp_z.sum(dim=-1, keepdim=True)
-        p = exp_z / denom
+        # p = exp_z / denom
         logprobs = z - torch.log(denom)
         logprobs_for_label = torch.gather(
             logprobs, dim=-1, index=labels.unsqueeze(-1)
@@ -286,7 +300,7 @@ def main():
             correct_answer = val_dataset[i]["answer"]
             generated_answer = remove_boxed(last_boxed_only_string(outputs[i]))
 
-            if generated_answer != None and is_equiv(generated_answer, correct_answer):
+            if generated_answer is not None and is_equiv(generated_answer, correct_answer):
                 correct += 1
                 idx_correct.append(i)
             else:
@@ -309,31 +323,48 @@ def main():
 
         return correct, idx_correct, idx_wrong
 
-    device = "cuda:0"
+    # device = "cuda:0"
 
     # Load model
     model_kwargs = dict(
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         use_cache=False,
-        device_map=device,
+        # device_map=device,
     )
     model = AutoModelForCausalLM.from_pretrained(args.model_id, **model_kwargs)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    model, optimizer = accelerator.prepare(model, optimizer)
     # Training loop
-    print("Starting initial evaluation...")
-    model = model.to(device)
-    c, ic, iw = eval_model(model, 0)
+    if accelerator.is_main_process:
+        print("Starting initial evaluation...")
+    # model = model.to(device)
+    # c, ic, iw = eval_model(model, 0)
+    if accelerator.is_main_process:
+        eval_model(model, 0)
     model.train()
+
+    local_prompts_per_step = args.n_prompts_per_step // accelerator.num_processes
 
     for i in range(args.n_grpo_steps):
         step_start_time = time.time()
 
-        sample_indices = random.sample(
-            range(0, len(train_dataset)), args.n_prompts_per_step
-        )
+        # sample_indices = random.sample(
+        #     range(0, len(train_dataset)), local_prompts_per_step
+        # )
+        # batch = train_dataset[sample_indices]
+        if accelerator.is_main_process:
+            sample_indices = random.sample(
+                range(len(train_dataset)), args.n_prompts_per_step
+            )
+        else:
+            sample_indices = [None] * args.n_prompts_per_step
+        
+        if accelerator.num_processes > 1:
+            sample_indices = broadcast_object_list(sample_indices, from_process=0)
+        
         batch = train_dataset[sample_indices]
 
         # Generate rollouts
@@ -351,8 +382,8 @@ def main():
 
         # Compute advantages
         raw_reward = [
-            a != None and is_equiv(a, batch["answer"][i // args.group_size])
-            for i, a in enumerate(generated_answers)
+            a is not None and is_equiv(a, batch["answer"][j // args.group_size])
+            for j, a in enumerate(generated_answers)
         ]
         raw_reward_tensor = torch.tensor(raw_reward, dtype=torch.float).reshape(
             (args.n_prompts_per_step, args.group_size)
@@ -374,19 +405,36 @@ def main():
 
         # Tokenize
         prompts_expanded = [x for x in batch["prompt"] for _ in range(args.group_size)]
+        # data = tokenize_prompt_and_output(prompts_expanded, outputs, tokenizer)
+        # input_ids = data["input_ids"].to(device)
+        # labels = data["labels"].to(device)
+        # response_mask = data["response_mask"].to(device)
+        num_processes = accelerator.num_processes
+        proc_idx = accelerator.process_index
+        
         data = tokenize_prompt_and_output(prompts_expanded, outputs, tokenizer)
         input_ids = data["input_ids"].to(device)
         labels = data["labels"].to(device)
         response_mask = data["response_mask"].to(device)
 
+        total_rollouts = len(input_ids)
+        per_proc = total_rollouts // num_processes
+        start = proc_idx * per_proc
+        end = start + per_proc
+        
+        input_ids     = input_ids[start:end]
+        labels        = labels[start:end]
+        response_mask = response_mask[start:end]
+        advantages    = advantages[start:end]
+
         # Compute old log probs
         with torch.inference_mode():
             old_logprobs_all = []
-            for b in range(len(input_ids) // args.micro_batch_size):
+            for b in range(max(1, len(input_ids) // args.micro_batch_size)):
                 idx = b * args.micro_batch_size
-                end = idx + args.micro_batch_size
-                x = input_ids[idx:end]
-                y = labels[idx:end]
+                end_idx = idx + args.micro_batch_size
+                x = input_ids[idx:end_idx]
+                y = labels[idx:end_idx]
                 old_logprobs_all.append(get_response_log_probs(model, x, y).detach())
             old_logprobs_all = torch.cat(old_logprobs_all, dim=0)
             assert old_logprobs_all.shape == labels.shape
@@ -398,10 +446,15 @@ def main():
 
         training_start = time.time()
         for epoch in range(args.epochs_per_step):
-            for b in tqdm(
-                range(len(input_ids) // args.micro_batch_size),
-                desc=f"Step {i + 1}/{args.n_grpo_steps}, Epoch {epoch + 1}/{args.epochs_per_step}",
-            ):
+            # for b in tqdm(
+            #     range(len(input_ids) // args.micro_batch_size),
+            #     desc=f"Step {i + 1}/{args.n_grpo_steps}, Epoch {epoch + 1}/{args.epochs_per_step}",
+            # ):
+            batches = range(max(1, len(input_ids) // args.micro_batch_size))
+            if accelerator.is_main_process:
+                batches = tqdm(batches, desc=f"Step {i + 1}/{args.n_grpo_steps}")
+            
+            for b in batches:
                 idx = b * args.micro_batch_size
                 end = idx + args.micro_batch_size
                 x = input_ids[idx:end]
@@ -436,10 +489,12 @@ def main():
                 loss_per_prompt = masked_loss.sum(dim=-1) / denom
                 loss = loss_per_prompt.mean() / args.gradient_accumulation_steps
 
-                loss.backward()
+                # loss.backward()
+                accelerator.backward(loss)
 
                 if (b + 1) % args.gradient_accumulation_steps == 0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     epoch_grad_norms.append(grad_norm.item())
                     optimizer.step()
                     optimizer.zero_grad()
@@ -447,59 +502,60 @@ def main():
         training_time = time.time() - training_start
         step_time = time.time() - step_start_time
 
-        # Compute statistics
-        mean_grad_norm = (
-            sum(epoch_grad_norms) / len(epoch_grad_norms) if epoch_grad_norms else 0
-        )
-        mean_policy_ratio = (
-            sum(epoch_policy_ratios) / len(epoch_policy_ratios)
-            if epoch_policy_ratios
-            else 0
-        )
-        mean_kl = sum(epoch_kl_divs) / len(epoch_kl_divs) if epoch_kl_divs else 0
-
-        # Count total tokens generated
-        total_tokens = response_mask.sum().item()
-        tokens_per_sec = total_tokens / generation_time if generation_time > 0 else 0
-        avg_generation_len = int(response_mask.sum(dim=-1).float().mean().item())
-
         # Log metrics to wandb
-        if not args.disable_wandb:
-            wandb.log(
-                {
-                    # Reward metrics
-                    "train/accuracy": train_accuracy,
-                    "train/reward_mean": train_accuracy,
-                    "train/reward_std": reward_std,
-                    "train/reward_max": reward_max,
-                    "train/reward_min": reward_min,
-                    # Advantage metrics
-                    "train/advantage_mean": advantage_mean,
-                    "train/advantage_std": advantage_std,
-                    "train/advantage_max": advantage_max,
-                    "train/advantage_min": advantage_min,
-                    # Training dynamics
-                    "train/grad_norm": mean_grad_norm,
-                    "train/policy_ratio": mean_policy_ratio,
-                    "train/approx_kl": mean_kl,
-                    "train/avg_gen_length": avg_generation_len,
-                    # Timing metrics
-                    "time/step_time": step_time,
-                    "time/generation_time": generation_time,
-                    "time/training_time": training_time,
-                    "time/tokens_per_sec": tokens_per_sec,
-                },
-                step=i + 1,
+        if accelerator.is_main_process:
+            # Compute statistics
+            mean_grad_norm = (
+                sum(epoch_grad_norms) / len(epoch_grad_norms) if epoch_grad_norms else 0
+            )
+            mean_policy_ratio = (
+                sum(epoch_policy_ratios) / len(epoch_policy_ratios)
+                if epoch_policy_ratios
+                else 0
+            )
+            mean_kl = sum(epoch_kl_divs) / len(epoch_kl_divs) if epoch_kl_divs else 0
+    
+            # Count total tokens generated
+            total_tokens = response_mask.sum().item()
+            tokens_per_sec = total_tokens / generation_time if generation_time > 0 else 0
+            avg_generation_len = int(response_mask.sum(dim=-1).float().mean().item())
+            if not args.disable_wandb:
+                wandb.log(
+                    {
+                        # Reward metrics
+                        "train/accuracy": train_accuracy,
+                        "train/reward_mean": train_accuracy,
+                        "train/reward_std": reward_std,
+                        "train/reward_max": reward_max,
+                        "train/reward_min": reward_min,
+                        # Advantage metrics
+                        "train/advantage_mean": advantage_mean,
+                        "train/advantage_std": advantage_std,
+                        "train/advantage_max": advantage_max,
+                        "train/advantage_min": advantage_min,
+                        # Training dynamics
+                        "train/grad_norm": mean_grad_norm,
+                        "train/policy_ratio": mean_policy_ratio,
+                        "train/approx_kl": mean_kl,
+                        "train/avg_gen_length": avg_generation_len,
+                        # Timing metrics
+                        "time/step_time": step_time,
+                        "time/generation_time": generation_time,
+                        "time/training_time": training_time,
+                        "time/tokens_per_sec": tokens_per_sec,
+                    },
+                    step=i + 1,
+                )
+    
+            print(
+                f"Step {i + 1}/{args.n_grpo_steps} | Train Acc: {train_accuracy:.2%} | KL: {mean_kl:.4f} | Time: {step_time:.1f}s"
             )
 
-        print(
-            f"Step {i + 1}/{args.n_grpo_steps} | Train Acc: {train_accuracy:.2%} | KL: {mean_kl:.4f} | Time: {step_time:.1f}s"
-        )
-
         if (i + 1) % 5 == 0:
-            eval_model(model, i + 1)
+            if accelerator.is_main_process:
+                eval_model(model, i + 1)
 
-    if not args.disable_wandb:
+    if accelerator.is_main_process and not args.disable_wandb:
         wandb.finish()
 
 
