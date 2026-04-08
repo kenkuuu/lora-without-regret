@@ -179,7 +179,7 @@ def main():
         vllm_model = LLM(
             model=args.model_id,
             tensor_parallel_size=1,
-            gpu_memory_utilization=0.4,
+            gpu_memory_utilization=0.3,
             # max_num_seqs=self.args.per_device_train_batch_size
             # * self.vllm_tensor_parallel_size
             # * self.args.steps_per_generation,
