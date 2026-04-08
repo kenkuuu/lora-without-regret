@@ -176,10 +176,12 @@ def main():
     train_dataset = train_dataset.map(process_data)
     val_dataset = val_dataset.map(process_data)
     if accelerator.is_main_process:
+        vllm_device = f"cuda:{accelerator.num_processes}"
         vllm_model = LLM(
             model=args.model_id,
+            device=vllm_device,
             tensor_parallel_size=1,
-            gpu_memory_utilization=0.3,
+            gpu_memory_utilization=0.8,
             # max_num_seqs=self.args.per_device_train_batch_size
             # * self.vllm_tensor_parallel_size
             # * self.args.steps_per_generation,
@@ -206,7 +208,7 @@ def main():
         # move weights from model to vllm
         if accelerator.is_main_process:
             unwrapped_model = accelerator.unwrap_model(model)
-            weight_tuples = [(n, p) for n, p in unwrapped_model.named_parameters()]
+            weight_tuples = [(n, p.cpu()) for n, p in unwrapped_model.named_parameters()]
             vllm_internal_model = (
                 vllm_model.llm_engine.model_executor.driver_worker.model_runner.model
             )
