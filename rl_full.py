@@ -111,6 +111,12 @@ def parse_args():
         action="store_true",
         help="Disable wandb logging",
     )
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.3,
+        help="vLLM GPU memory utilization",
+    )
 
     return parser.parse_args()
 
@@ -179,7 +185,7 @@ def main():
         vllm_model = LLM(
             model=args.model_id,
             tensor_parallel_size=1,
-            gpu_memory_utilization=0.8,
+            gpu_memory_utilization=args.gpu_memory_utilization,
             # max_num_seqs=self.args.per_device_train_batch_size
             # * self.vllm_tensor_parallel_size
             # * self.args.steps_per_generation,
