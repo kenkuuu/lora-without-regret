@@ -2,14 +2,16 @@
 this script requires vllm's v0 engine which has a hacky way to reload model weights
 so we have pinned to v0.10.2 release of vllm
 
-uv run rl_full.py --lr 1e-5 --disable_wandb
+accelerate launch --num_processes=<N> rl_full.py --num_train_gpus=<N>
+CUDA_VISIBLE_DEVICES must include GPUs 0..<N> for training and GPU <N> for vLLM
+e.g. CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --num_processes=3 rl_full.py --num_train_gpus=3
 """
 
-from vllm import LLM, SamplingParams
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase
 from math_utils import last_boxed_only_string, remove_boxed, is_equiv
 import torch
+import torch.multiprocessing as mp
 from tqdm import tqdm
 import random
 import argparse
@@ -17,11 +19,62 @@ import wandb
 import time
 import os
 from accelerate import Accelerator
-from accelerate.utils import broadcast_object_list
+from accelerate.utils import broadcast_object_list, InitProcessGroupKwargs
+from datetime import timedelta
 
-os.environ["VLLM_USE_V1"] = (
-    "0"  # use v0 engine because it lets us move weights between hf_model and vllm_model
-)
+
+def vllm_worker(model_id, vllm_gpu_index, gpu_memory_utilization, cmd_q, result_q):
+    """
+    Subprocess that owns the vLLM engine on a dedicated GPU.
+    Receives commands via cmd_q and sends results via result_q.
+    Commands:
+      ("update_weights", weight_tuples) -> "OK"
+      ("generate", (prompts, sp_kwargs)) -> outputs
+      "STOP" -> exit
+    """
+    # Prevent interference with the training processes' NCCL setup
+    for var in ["RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
+                "TORCHELASTIC_AGENT_SOCKET_TIMEOUT", "NCCL_SOCKET_IFNAME"]:
+        os.environ.pop(var, None)
+
+    # Map vllm_gpu_index to the actual physical GPU from parent's CUDA_VISIBLE_DEVICES
+    parent_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if parent_cvd:
+        gpu_ids = parent_cvd.split(",")
+        vllm_cuda = gpu_ids[vllm_gpu_index] if vllm_gpu_index < len(gpu_ids) else str(vllm_gpu_index)
+    else:
+        vllm_cuda = str(vllm_gpu_index)
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = vllm_cuda
+    os.environ["VLLM_USE_V1"] = "0"
+
+    from vllm import LLM, SamplingParams
+
+    model = LLM(
+        model=model_id,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=2048,
+        max_num_batched_tokens=4096,
+        logprobs_mode="processed_logprobs",
+    )
+    result_q.put("READY")
+
+    while True:
+        msg = cmd_q.get()
+        if msg == "STOP":
+            break
+        cmd, payload = msg
+        if cmd == "update_weights":
+            internal = model.llm_engine.model_executor.driver_worker.model_runner.model
+            internal.load_weights(payload)
+            result_q.put("OK")
+        elif cmd == "generate":
+            prompts, sp_kwargs = payload
+            sp = SamplingParams(**sp_kwargs)
+            raw = model.generate(prompts, sp)
+            outputs = [o.text for r in raw for o in r.outputs]
+            result_q.put(outputs)
 
 
 def parse_args():
@@ -31,7 +84,7 @@ def parse_args():
     parser.add_argument(
         "--model_id",
         type=str,
-        default="Qwen/Qwen3-1.7B",
+        default="Qwen/Qwen2.5-1.5B-Instruct",
         help="HuggingFace model ID to use",
     )
 
@@ -132,26 +185,26 @@ def main():
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
+    # Spawn vLLM subprocess on rank0 BEFORE Accelerator init.
+    # vLLM loading and NCCL init then proceed in parallel, avoiding timeout.
     if local_rank == 0:
-        # vLLM専用GPU（num_train_gpus番）だけ見せて初期化
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.num_train_gpus)
-        vllm_model = LLM(
-            model=args.model_id,
-            tensor_parallel_size=1,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            max_model_len=2048,
-            max_num_batched_tokens=4096,
-            logprobs_mode="processed_logprobs",
+        ctx = mp.get_context("spawn")
+        cmd_queue = ctx.Queue()
+        result_queue = ctx.Queue()
+        vllm_proc = ctx.Process(
+            target=vllm_worker,
+            args=(args.model_id, args.num_train_gpus, args.gpu_memory_utilization,
+                  cmd_queue, result_queue),
+            daemon=True,
         )
-        # vLLM初期化後は学習GPU群（0〜num_train_gpus-1）に戻す
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
-            str(i) for i in range(args.num_train_gpus)
-        )
+        vllm_proc.start()
     else:
-        vllm_model = None
+        cmd_queue = result_queue = vllm_proc = None
 
-    # vLLM初期化後にAcceleratorを起動 → NCCLのTCPStoreと競合しない
-    accelerator = Accelerator()
+    # Long timeout so all ranks can wait while rank0 waits for vLLM to load
+    accelerator = Accelerator(
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=2))]
+    )
     device = accelerator.device
 
     # Set random seed
@@ -185,6 +238,14 @@ def main():
             )
             wandb.config.update({"run_dir": run_name})
 
+        # Wait for vLLM subprocess to finish loading
+        print("Waiting for vLLM to load...")
+        result_queue.get()  # blocks until "READY"
+        print("vLLM ready.")
+
+    # Sync all ranks after vLLM is ready
+    accelerator.wait_for_everyone()
+
     # Load dataset and tokenizer
     train_dataset = load_dataset("qwedsacf/competition_math", split=f"train[:7500]")
     val_dataset = load_dataset("qwedsacf/competition_math", split=f"train[-5000:]")
@@ -216,26 +277,23 @@ def main():
         Returns a list of outputs of length len(prompts) * responses_per_prompt.
         """
         if accelerator.is_main_process:
-            # HFモデルの最新重みをCPU経由でvLLM専用GPUに転送
-            unwrapped_model = accelerator.unwrap_model(model)
-            weight_tuples = [(n, p.detach().cpu()) for n, p in unwrapped_model.named_parameters()]
-            vllm_internal_model = (
-                vllm_model.llm_engine.model_executor.driver_worker.model_runner.model
-            )
-            vllm_internal_model.load_weights(weight_tuples)
+            # Sync current training weights to vLLM subprocess
+            unwrapped = accelerator.unwrap_model(model)
+            weight_tuples = [(n, p.detach().cpu()) for n, p in unwrapped.named_parameters()]
+            cmd_queue.put(("update_weights", weight_tuples))
+            result_queue.get()  # "OK"
 
-            sampling_params = SamplingParams(
-                max_tokens=1024,
-                temperature=temperature,
-                n=responses_per_prompt,
-            )
-            raw_outputs = vllm_model.generate(prompts, sampling_params)
-            outputs = [o.text for output in raw_outputs for o in output.outputs]
+            # Generate
+            cmd_queue.put(("generate", (prompts, {
+                "max_tokens": 1024,
+                "temperature": temperature,
+                "n": responses_per_prompt,
+            })))
+            outputs = result_queue.get()
         else:
-            # Placeholder; overwritten by broadcast below
             outputs = [None] * (len(prompts) * responses_per_prompt)
 
-        # rank0の推論完了を全プロセスで同期してからbroadcast
+        # Sync all ranks and broadcast results
         accelerator.wait_for_everyone()
         if accelerator.num_processes > 1:
             outputs = broadcast_object_list(outputs, from_process=0)
@@ -297,42 +355,41 @@ def main():
         return logprobs_for_label
 
     def eval_model(model, step):
-        """Must be called only on the main process."""
+        """Called from ALL processes. generate() handles internal synchronization."""
         val_prompts = val_dataset[:1000]["prompt"]
 
         eval_start = time.time()
         outputs = generate(val_prompts, model, temperature=0)
         eval_time = time.time() - eval_start
 
-        correct = 0
-        idx_correct = []
-        idx_wrong = []
+        if accelerator.is_main_process:
+            correct = 0
+            idx_correct = []
+            idx_wrong = []
 
-        for i in range(len(outputs)):
-            correct_answer = val_dataset[i]["answer"]
-            generated_answer = remove_boxed(last_boxed_only_string(outputs[i]))
+            for i in range(len(outputs)):
+                correct_answer = val_dataset[i]["answer"]
+                generated_answer = remove_boxed(last_boxed_only_string(outputs[i]))
 
-            if generated_answer is not None and is_equiv(generated_answer, correct_answer):
-                correct += 1
-                idx_correct.append(i)
-            else:
-                idx_wrong.append(i)
+                if generated_answer is not None and is_equiv(generated_answer, correct_answer):
+                    correct += 1
+                    idx_correct.append(i)
+                else:
+                    idx_wrong.append(i)
 
-        accuracy = correct / len(outputs)
-        print(f"step={step}, correct: {correct} / {len(outputs)} ({accuracy:.2%})")
+            accuracy = correct / len(outputs)
+            print(f"step={step}, correct: {correct} / {len(outputs)} ({accuracy:.2%})")
 
-        if not args.disable_wandb:
-            wandb.log(
-                {
-                    "eval/accuracy": accuracy,
-                    "eval/correct": correct,
-                    "eval/total": len(outputs),
-                    "eval/time_seconds": eval_time,
-                },
-                step=step,
-            )
-
-        return correct, idx_correct, idx_wrong
+            if not args.disable_wandb:
+                wandb.log(
+                    {
+                        "eval/accuracy": accuracy,
+                        "eval/correct": correct,
+                        "eval/total": len(outputs),
+                        "eval/time_seconds": eval_time,
+                    },
+                    step=step,
+                )
 
     # Load model
     model_kwargs = dict(
@@ -345,11 +402,10 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     model, optimizer = accelerator.prepare(model, optimizer)
 
-    # Initial evaluation
+    # Initial evaluation (all processes participate via generate()'s barriers)
     if accelerator.is_main_process:
         print("Starting initial evaluation...")
-        eval_model(model, 0)
-    accelerator.wait_for_everyone()
+    eval_model(model, 0)
     model.train()
 
     num_processes = accelerator.num_processes
@@ -407,12 +463,12 @@ def main():
         advantage_max = advantages.max().item()
         advantage_min = advantages.min().item()
 
-        # Tokenize full batch
+        # Tokenize full batch (CPU)
         prompts_expanded = [x for x in batch["prompt"] for _ in range(args.group_size)]
         data = tokenize_prompt_and_output(prompts_expanded, outputs, tokenizer)
-        input_ids = data["input_ids"].to(device)
-        labels = data["labels"].to(device)
-        response_mask = data["response_mask"].to(device)
+        input_ids = data["input_ids"]      # keep on CPU
+        labels = data["labels"]            # keep on CPU
+        response_mask = data["response_mask"]  # keep on CPU
 
         # Shard across processes: each GPU trains on its own slice
         total_rollouts = len(input_ids)
@@ -431,8 +487,8 @@ def main():
             for b in range(max(1, len(input_ids) // args.micro_batch_size)):
                 idx = b * args.micro_batch_size
                 end_idx = idx + args.micro_batch_size
-                x = input_ids[idx:end_idx]
-                y = labels[idx:end_idx]
+                x = input_ids[idx:end_idx].to(device)
+                y = labels[idx:end_idx].to(device)
                 old_logprobs_all.append(get_response_log_probs(model, x, y).detach())
             old_logprobs_all = torch.cat(old_logprobs_all, dim=0)
             assert old_logprobs_all.shape == labels.shape
@@ -451,9 +507,9 @@ def main():
             for b in batches:
                 idx = b * args.micro_batch_size
                 end_idx = idx + args.micro_batch_size
-                x = input_ids[idx:end_idx]
-                y = labels[idx:end_idx]
-                mask = response_mask[idx:end_idx]
+                x = input_ids[idx:end_idx].to(device)
+                y = labels[idx:end_idx].to(device)
+                mask = response_mask[idx:end_idx].to(device)
                 micro_batch_adv = advantages[idx:end_idx].unsqueeze(-1).to(device)
 
                 policy_logprobs = get_response_log_probs(model, x, y)
@@ -533,12 +589,13 @@ def main():
             )
 
         if (i + 1) % 5 == 0:
-            if accelerator.is_main_process:
-                eval_model(model, i + 1)
-            accelerator.wait_for_everyone()
+            eval_model(model, i + 1)  # all processes participate via generate()'s barriers
 
-    if accelerator.is_main_process and not args.disable_wandb:
-        wandb.finish()
+    if accelerator.is_main_process:
+        if not args.disable_wandb:
+            wandb.finish()
+        cmd_queue.put("STOP")
+        vllm_proc.join(timeout=10)
 
 
 if __name__ == "__main__":
