@@ -307,11 +307,7 @@ def main():
         labels: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         logits = model(input_ids).logits
-        z = logits - logits.max(dim=-1, keepdim=True).values
-        exp_z = torch.exp(z)
-        denom = exp_z.sum(dim=-1, keepdim=True)
-        p = exp_z / denom
-        logprobs = z - torch.log(denom)
+        logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
         logprobs_for_label = torch.gather(
             logprobs, dim=-1, index=labels.unsqueeze(-1)
         ).squeeze(-1)
