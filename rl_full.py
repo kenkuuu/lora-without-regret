@@ -176,10 +176,8 @@ def main():
     train_dataset = train_dataset.map(process_data)
     val_dataset = val_dataset.map(process_data)
     if accelerator.is_main_process:
-        vllm_device = f"cuda:{accelerator.num_processes}"
         vllm_model = LLM(
             model=args.model_id,
-            device=vllm_device,
             tensor_parallel_size=1,
             gpu_memory_utilization=0.8,
             # max_num_seqs=self.args.per_device_train_batch_size
