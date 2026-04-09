@@ -49,6 +49,16 @@ def vllm_worker(model_id, vllm_gpu_index, gpu_memory_utilization, cmd_q, result_
     os.environ["VLLM_USE_V1"] = "0"
 
     from vllm import LLM, SamplingParams
+    import sys
+
+    # vLLM calls get_ip() to construct the distributed init method URL.
+    # On some clusters, the node's external IP (e.g. 192.168.x.x) is unreachable
+    # for loopback connections, causing TCPStore timeouts.
+    # Patch get_ip in all loaded vllm modules to use localhost instead.
+    _patch_get_ip = lambda: "127.0.0.1"
+    for _mod in list(sys.modules.values()):
+        if hasattr(_mod, "get_ip") and "vllm" in getattr(_mod, "__name__", ""):
+            _mod.get_ip = _patch_get_ip
 
     model = LLM(
         model=model_id,
