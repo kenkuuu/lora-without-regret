@@ -47,18 +47,29 @@ def vllm_worker(model_id, vllm_gpu_index, gpu_memory_utilization, cmd_q, result_
 
     os.environ["CUDA_VISIBLE_DEVICES"] = vllm_cuda
     os.environ["VLLM_USE_V1"] = "0"
+    # Remove any port-fixing env vars so vLLM picks a truly free port
+    for var in ["VLLM_PORT", "VLLM_HOST_IP"]:
+        os.environ.pop(var, None)
 
     from vllm import LLM, SamplingParams
     import sys
+    import tempfile
 
-    # vLLM calls get_ip() to construct the distributed init method URL.
-    # On some clusters, the node's external IP (e.g. 192.168.x.x) is unreachable
-    # for loopback connections, causing TCPStore timeouts.
-    # Patch get_ip in all loaded vllm modules to use localhost instead.
-    _patch_get_ip = lambda: "127.0.0.1"
+    # vLLM always calls torch.distributed.init_process_group (even for TP=1),
+    # constructing a tcp:// rendezvous URL from get_ip() + get_open_port().
+    # On clusters, TCP connections to the node's own IP can be blocked/broken.
+    # Fix: patch get_distributed_init_method to use a file:// rendezvous instead,
+    # which avoids all network/firewall/IPv4-IPv6 issues.
+    _rendezvous_file = tempfile.mktemp(prefix="vllm_dist_")
+    _file_init = f"file://{_rendezvous_file}"
+
     for _mod in list(sys.modules.values()):
-        if hasattr(_mod, "get_ip") and "vllm" in getattr(_mod, "__name__", ""):
-            _mod.get_ip = _patch_get_ip
+        if "vllm" not in getattr(_mod, "__name__", ""):
+            continue
+        if hasattr(_mod, "get_distributed_init_method"):
+            _mod.get_distributed_init_method = lambda ip, port: _file_init
+        if hasattr(_mod, "get_ip"):
+            _mod.get_ip = lambda: "127.0.0.1"
 
     model = LLM(
         model=model_id,
