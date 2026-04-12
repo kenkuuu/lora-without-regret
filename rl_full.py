@@ -33,15 +33,26 @@ def vllm_worker(model_id, vllm_gpu_index, gpu_memory_utilization, cmd_q, result_
       "STOP" -> exit
     """
     # Prevent interference with the training processes' NCCL setup
-    for var in ["RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
-                "TORCHELASTIC_AGENT_SOCKET_TIMEOUT", "NCCL_SOCKET_IFNAME"]:
+    for var in [
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCHELASTIC_AGENT_SOCKET_TIMEOUT",
+        "NCCL_SOCKET_IFNAME",
+    ]:
         os.environ.pop(var, None)
 
     # Map vllm_gpu_index to the actual physical GPU from parent's CUDA_VISIBLE_DEVICES
     parent_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if parent_cvd:
         gpu_ids = parent_cvd.split(",")
-        vllm_cuda = gpu_ids[vllm_gpu_index] if vllm_gpu_index < len(gpu_ids) else str(vllm_gpu_index)
+        vllm_cuda = (
+            gpu_ids[vllm_gpu_index]
+            if vllm_gpu_index < len(gpu_ids)
+            else str(vllm_gpu_index)
+        )
     else:
         vllm_cuda = str(vllm_gpu_index)
 
@@ -214,8 +225,13 @@ def main():
         result_queue = ctx.Queue()
         vllm_proc = ctx.Process(
             target=vllm_worker,
-            args=(args.model_id, args.num_train_gpus, args.gpu_memory_utilization,
-                  cmd_queue, result_queue),
+            args=(
+                args.model_id,
+                args.num_train_gpus,
+                args.gpu_memory_utilization,
+                cmd_queue,
+                result_queue,
+            ),
             daemon=True,
         )
         vllm_proc.start()
@@ -250,7 +266,9 @@ def main():
 
         # Initialize wandb
         if not args.disable_wandb:
-            wandb_run_name = args.wandb_run_name or f"{args.model_id}_{args.lr:.1e}_full"
+            wandb_run_name = (
+                args.wandb_run_name or f"{args.model_id}_{args.lr:.1e}_full"
+            )
             wandb.init(
                 project=args.wandb_project,
                 name=wandb_run_name,
@@ -300,16 +318,26 @@ def main():
         if accelerator.is_main_process:
             # Sync current training weights to vLLM subprocess
             unwrapped = accelerator.unwrap_model(model)
-            weight_tuples = [(n, p.detach().cpu()) for n, p in unwrapped.named_parameters()]
+            weight_tuples = [
+                (n, p.detach().cpu()) for n, p in unwrapped.named_parameters()
+            ]
             cmd_queue.put(("update_weights", weight_tuples))
             result_queue.get()  # "OK"
 
             # Generate
-            cmd_queue.put(("generate", (prompts, {
-                "max_tokens": 1024,
-                "temperature": temperature,
-                "n": responses_per_prompt,
-            })))
+            cmd_queue.put(
+                (
+                    "generate",
+                    (
+                        prompts,
+                        {
+                            "max_tokens": 1024,
+                            "temperature": temperature,
+                            "n": responses_per_prompt,
+                        },
+                    ),
+                )
+            )
             outputs = result_queue.get()
         else:
             outputs = [None] * (len(prompts) * responses_per_prompt)
@@ -392,7 +420,9 @@ def main():
                 correct_answer = val_dataset[i]["answer"]
                 generated_answer = remove_boxed(last_boxed_only_string(outputs[i]))
 
-                if generated_answer is not None and is_equiv(generated_answer, correct_answer):
+                if generated_answer is not None and is_equiv(
+                    generated_answer, correct_answer
+                ):
                     correct += 1
                     idx_correct.append(i)
                 else:
@@ -487,8 +517,8 @@ def main():
         # Tokenize full batch (CPU)
         prompts_expanded = [x for x in batch["prompt"] for _ in range(args.group_size)]
         data = tokenize_prompt_and_output(prompts_expanded, outputs, tokenizer)
-        input_ids = data["input_ids"]      # keep on CPU
-        labels = data["labels"]            # keep on CPU
+        input_ids = data["input_ids"]  # keep on CPU
+        labels = data["labels"]  # keep on CPU
         response_mask = data["response_mask"]  # keep on CPU
 
         # Shard across processes: each GPU trains on its own slice
@@ -497,10 +527,10 @@ def main():
         start = proc_idx * per_proc
         end = start + per_proc
 
-        input_ids     = input_ids[start:end]
-        labels        = labels[start:end]
+        input_ids = input_ids[start:end]
+        labels = labels[start:end]
         response_mask = response_mask[start:end]
-        advantages    = advantages[start:end]
+        advantages = advantages[start:end]
 
         # Compute old log probs (on each process's local shard)
         with torch.inference_mode():
@@ -578,7 +608,9 @@ def main():
             mean_kl = sum(epoch_kl_divs) / len(epoch_kl_divs) if epoch_kl_divs else 0
 
             total_tokens = response_mask.sum().item()
-            tokens_per_sec = total_tokens / generation_time if generation_time > 0 else 0
+            tokens_per_sec = (
+                total_tokens / generation_time if generation_time > 0 else 0
+            )
             avg_generation_len = int(response_mask.sum(dim=-1).float().mean().item())
 
             if not args.disable_wandb:
@@ -609,8 +641,10 @@ def main():
                 f"Step {i + 1}/{args.n_grpo_steps} | Train Acc: {train_accuracy:.2%} | KL: {mean_kl:.4f} | Time: {step_time:.1f}s"
             )
 
-        if (i + 1) % 5 == 0:
-            eval_model(model, i + 1)  # all processes participate via generate()'s barriers
+        if (i + 1) % 1 == 0:
+            eval_model(
+                model, i + 1
+            )  # all processes participate via generate()'s barriers
 
     if accelerator.is_main_process:
         if not args.disable_wandb:
